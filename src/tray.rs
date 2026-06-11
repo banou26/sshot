@@ -127,7 +127,7 @@ pub fn spawn(sender: Sender<Action>) {
                     if attempt > 1 {
                         eprintln!("tray: registered on attempt {attempt}");
                     }
-                    // handle is leaked intentionally — tray lives until process exits
+                    // handle is leaked intentionally - tray lives until process exits
                     std::mem::forget(handle);
                     return;
                 }
@@ -138,6 +138,6 @@ pub fn spawn(sender: Sender<Action>) {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        eprintln!("tray: giving up after 60 attempts — no StatusNotifierWatcher");
+        eprintln!("tray: giving up after 60 attempts: no StatusNotifierWatcher");
     });
 }

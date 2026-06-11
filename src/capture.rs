@@ -8,7 +8,7 @@ pub fn capture_workspace() -> Result<(Vec<u8>, u32, u32, u32)> {
         .args(["-t", "ppm", "-"])
         .stdout(Stdio::piped())
         .output()
-        .context("Failed to run grim — is it installed?")?;
+        .context("Failed to run grim (is it installed?)")?;
 
     if !output.status.success() {
         anyhow::bail!("grim failed: {}", String::from_utf8_lossy(&output.stderr));

@@ -288,7 +288,7 @@ fn main() -> Result<()> {
             eprintln!("sshot daemon already running (pid {existing}), exiting.");
             return Ok(());
         }
-        // Stale PID file — remove and continue
+        // Stale PID file - remove and continue
         remove_pid();
     }
 
