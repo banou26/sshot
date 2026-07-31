@@ -21,3 +21,8 @@ libc = "0.2"
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+strip = true
+# Not panic = "abort": the tray runs on a background thread whose D-Bus stack
+# recovers panicking tasks by unwinding, and aborting would turn a survivable
+# hiccup there into a dead daemon.
