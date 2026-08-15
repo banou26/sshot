@@ -46,8 +46,11 @@ pub struct CaptureResult {
     pub ss_stride: u32,
     /// What the user selected.
     pub selection: Selection,
-    /// Scale factor (physical / logical).
-    pub scale: f64,
+    /// How logical coordinates map onto the capture. Carries the bounding box
+    /// origin as well as the scale, which a bare scale factor loses: an output
+    /// at a negative logical coordinate puts that origin somewhere other than
+    /// zero, and every crop is then offset by it.
+    pub space: CaptureSpace,
 }
 
 // ── Internal types ───────────────────────────────────────────────
@@ -112,6 +115,24 @@ impl Rect {
         let x2 = (a.x + a.w as i32).max(b.x + b.w as i32);
         let y2 = (a.y + a.h as i32).max(b.y + b.h as i32);
         Rect { x, y, w: (x2 - x).max(0) as u32, h: (y2 - y).max(0) as u32 }
+    }
+}
+
+/// The region to report as damaged when the highlight changes.
+///
+/// Wayland keeps whatever was committed before outside the damage, so this has
+/// to cover every pixel where the new buffer differs from what is ON SCREEN,
+/// which is the last committed highlight and not whatever this buffer happened
+/// to hold. Measuring it against the buffer instead left the previous outline
+/// standing whenever the new highlight fell inside it, which is exactly what
+/// happens when the pointer moves from a tile onto a float sitting on top of
+/// it: both outlines showed at once.
+fn damage_between(shown: Option<Rect>, next: Option<Rect>, bw: u32) -> Option<Rect> {
+    match (shown, next) {
+        (None, None) => None,
+        (Some(a), None) => Some(a.inflate(bw)),
+        (None, Some(b)) => Some(b.inflate(bw)),
+        (Some(a), Some(b)) => Some(Rect::union(a.inflate(bw), b.inflate(bw))),
     }
 }
 
@@ -351,6 +372,15 @@ impl App {
             Some((to_rect(x, y, w, h), reg_border))
         } else if let Some(widx) = self.hovered_window {
             let w = &self.windows[widx];
+            // A window rect is clipped to one output, so every other surface
+            // has nothing of it to draw. Without this the border strips, which
+            // are placed just outside the rect, landed on the neighbouring
+            // monitor whenever a window ended at the shared edge.
+            let (sx0, sy0) = (surf.logical_x as f64, surf.logical_y as f64);
+            let (sx1, sy1) = (sx0 + surf.phys_w as f64 / s, sy0 + surf.phys_h as f64 / s);
+            if w.x >= sx1 || w.x + w.width <= sx0 || w.y >= sy1 || w.y + w.height <= sy0 {
+                return None;
+            }
             Some((to_rect(w.x, w.y, w.width, w.height), win_border))
         } else {
             None
@@ -405,7 +435,12 @@ impl App {
         };
 
         let was_initialized = surf.buffers[bi].initialized;
+        // What this buffer already holds, which is what has to be painted over.
         let previous_hl = surf.buffers[bi].drawn_hl;
+        // What the compositor is currently showing, which is what the damage
+        // has to be measured against. With two buffers in rotation the two
+        // disagree by a frame, and they are not interchangeable.
+        let shown_hl = surf.shown_hl;
 
         let dimmed = &surf.dimmed;
         let (ox, oy) = (surf.ss_offset_x, surf.ss_offset_y);
@@ -429,16 +464,11 @@ impl App {
             draw_border(canvas, phys_w, phys_h, hl, border_width, border_color);
         }
 
-        // Damage only what actually changed in the surface.
+        // Damage only what actually changed on screen.
         let damage = if !was_initialized {
             Some(Rect { x: 0, y: 0, w: phys_w, h: phys_h })
         } else {
-            match (previous_hl, hl) {
-                (None, None) => None,
-                (Some(a), None) => Some(a.inflate(border_width)),
-                (None, Some(b)) => Some(b.inflate(border_width)),
-                (Some(a), Some(b)) => Some(Rect::union(a.inflate(border_width), b.inflate(border_width))),
-            }
+            damage_between(shown_hl, hl, border_width)
         };
 
         surf.buffers[bi].initialized = true;
@@ -739,8 +769,47 @@ pub fn run(config: &Config) -> Result<Option<CaptureResult>> {
     match app.selection {
         Some(sel) => Ok(Some(CaptureResult {
             ss_data: app.ss_data, ss_width: app.ss_width, ss_stride: app.ss_stride,
-            selection: sel, scale: app.space.scale,
+            selection: sel, space: app.space,
         })),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn covers(damage: Rect, r: Rect, bw: u32) -> bool {
+        let bw = bw as i32;
+        damage.x <= r.x - bw
+            && damage.y <= r.y - bw
+            && damage.x + damage.w as i32 >= r.x + r.w as i32 + bw
+            && damage.y + damage.h as i32 >= r.y + r.h as i32 + bw
+    }
+
+    /// The reported bug: hovering a float that sits inside a tile left both
+    /// outlines on screen. The new highlight is wholly inside the old one, so
+    /// damaging only the new one leaves the old one untouched and visible.
+    #[test]
+    fn moving_onto_a_float_repaints_the_tile_outline_away() {
+        let tile = Rect { x: 12, y: 12, w: 3816, h: 2082 };
+        let float = Rect { x: 711, y: 579, w: 2166, h: 1254 };
+        let bw = 3;
+
+        let damage = damage_between(Some(tile), Some(float), bw).expect("the highlight moved");
+        assert!(covers(damage, tile, bw), "the outline still on screen must be repainted");
+        assert!(covers(damage, float, bw), "the new outline must be painted");
+    }
+
+    #[test]
+    fn losing_the_highlight_repaints_it_away() {
+        let tile = Rect { x: 12, y: 12, w: 3816, h: 2082 };
+        let damage = damage_between(Some(tile), None, 3).expect("the highlight went away");
+        assert!(covers(damage, tile, 3));
+    }
+
+    #[test]
+    fn an_unchanged_empty_highlight_damages_nothing() {
+        assert_eq!(damage_between(None, None, 3), None);
     }
 }

@@ -73,6 +73,31 @@ fn copy_png_to_clipboard(png: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Wait for a file another process is writing to appear and stop growing.
+///
+/// Bounded so a compositor that never writes the file reports an error instead
+/// of hanging the daemon.
+fn wait_for_file(path: &Path) -> Result<()> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const STEP: std::time::Duration = std::time::Duration::from_millis(20);
+
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let mut last_len = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let len = meta.len();
+            // A PNG is written in one pass, so an unchanged non-zero size one
+            // step apart means the write finished.
+            if len > 0 && last_len == Some(len) {
+                return Ok(());
+            }
+            last_len = Some(len);
+        }
+        std::thread::sleep(STEP);
+    }
+    anyhow::bail!("timed out waiting for the file to be written")
+}
+
 fn save_and_copy(result: &CaptureResult, config: &Config) -> Result<PathBuf> {
     match &result.selection {
         Selection::Window { title, id } => {
@@ -97,17 +122,28 @@ fn save_and_copy(result: &CaptureResult, config: &Config) -> Result<PathBuf> {
                 anyhow::bail!("niri screenshot-window failed");
             }
 
+            // `niri msg` replies as soon as the compositor has queued the
+            // action, so the file is not there yet when it returns. Everything
+            // downstream (the tray's open entry, --oneshot printing a path a
+            // script then reads) assumes it is.
+            wait_for_file(&filepath)
+                .with_context(|| format!("niri did not write {}", filepath.display()))?;
+
             eprintln!("Saved: {}", filepath.display());
             Ok(filepath)
         }
         Selection::Region { x, y, w, h } => {
-            let s = result.scale;
+            // Through the capture space, not a bare scale: the composite's
+            // origin is the bounding box of every output, so an output at a
+            // negative logical coordinate shifts it away from zero and a plain
+            // multiply would crop the wrong part of the screen.
+            let sp = result.space;
             let ss_h = result.ss_data.len() as u32 / result.ss_stride;
 
-            let px = ((x * s).round() as u32).min(result.ss_width.saturating_sub(1));
-            let py = ((y * s).round() as u32).min(ss_h.saturating_sub(1));
-            let pw = ((w * s).round() as u32).min(result.ss_width - px);
-            let ph = ((h * s).round() as u32).min(ss_h - py);
+            let px = (sp.to_phys_x(*x).round().max(0.0) as u32).min(result.ss_width.saturating_sub(1));
+            let py = (sp.to_phys_y(*y).round().max(0.0) as u32).min(ss_h.saturating_sub(1));
+            let pw = ((w * sp.scale).round() as u32).min(result.ss_width - px);
+            let ph = ((h * sp.scale).round() as u32).min(ss_h - py);
 
             if pw == 0 || ph == 0 { anyhow::bail!("Selection is empty"); }
 
@@ -166,8 +202,21 @@ fn read_pid() -> Option<u32> {
     std::fs::read_to_string(pid_path()).ok()?.trim().parse().ok()
 }
 
+/// Clear a pid file that names a process which is no longer there.
 fn remove_pid() {
     let _ = std::fs::remove_file(pid_path());
+}
+
+/// Deregister on shutdown, but only while the file still names this process.
+///
+/// A second daemon that overwrote the file and then exited would otherwise
+/// take the live daemon's registration with it, leaving `--trigger` saying
+/// nothing is running while the tray icon is still sitting there.
+fn remove_own_pid() {
+    if read_pid().is_some_and(|pid| pid != std::process::id()) {
+        return;
+    }
+    remove_pid();
 }
 
 /// Check if a process with the given PID is alive (sends signal 0).
@@ -480,7 +529,7 @@ fn main() -> Result<()> {
         }
     }
 
-    remove_pid();
+    remove_own_pid();
     eprintln!("Daemon stopped");
     Ok(())
 }
