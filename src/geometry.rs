@@ -309,6 +309,13 @@ pub fn layout_windows(snap: &Snapshot, gap: f64, cap: Option<&Capture>) -> Vec<W
         return Vec::new();
     }
 
+    // A float being dragged is detached from its workspace: niri reports it
+    // with no workspace and no position, so there is nothing to place it by.
+    // Say so rather than leaving an unexplained hole in the selection.
+    if snap.windows.iter().any(|w| w.is_floating && w.workspace_id.is_none()) {
+        eprintln!("sshot: a floating window is mid move and cannot be selected");
+    }
+
     let space = CaptureSpace::from_snapshot(snap);
     let mut result = Vec::new();
 
@@ -393,42 +400,84 @@ pub fn layout_windows(snap: &Snapshot, gap: f64, cap: Option<&Capture>) -> Vec<W
         // niri composites floats above tiles. Hit testing scans this list in
         // reverse, so floats have to come after tiles or a float over a tile
         // can never be picked. Oldest first so the newest float wins.
-        let mut floats: Vec<&Window> = wins.iter().copied().filter(|w| w.is_floating).collect();
-        floats.sort_by_key(|w| w.focus_nanos());
-        for w in floats {
-            let Some(pos) = w.layout.tile_pos_in_workspace_view else { continue };
-            let ox = l.x + pos.0 + w.layout.window_offset_in_tile.0;
-            let oy = tile_top - resolved_gap.min(tile_top - l.y) + pos.1
-                + w.layout.window_offset_in_tile.1;
-            result.push(WindowInfo {
-                title: w.title.clone().unwrap_or_default(),
-                id: w.id.to_string(),
-                x: ox,
-                y: oy,
-                width: w.layout.window_size.0,
-                height: w.layout.window_size.1,
-            });
+        //
+        // Unlike a tile, a float needs nothing measured from the capture: niri
+        // reports its position outright. So this runs even when the tiled
+        // resolution above gave up.
+        if floats_are_visible(&wins, ws.active_window_id, l) {
+            let mut floats: Vec<&Window> =
+                wins.iter().copied().filter(|w| w.is_floating).collect();
+            floats.sort_by_key(|w| w.focus_nanos());
+            for w in floats {
+                let Some(pos) = w.layout.tile_pos_in_workspace_view else { continue };
+                // The reported position already counts the working area origin
+                // (niri adds it in `Data::recompute_logical_pos`), so adding the
+                // recovered tile top on top of it counted a top bar twice.
+                push_window(&mut result, w, l.x + pos.0, l.y + pos.1, l);
+            }
         }
     }
 
     result
 }
 
+/// Whether this workspace's floating windows are on screen at all.
+///
+/// niri hides the whole floating space while the active column is fullscreen,
+/// so emitting the floats there would lay invisible rectangles over the window
+/// that fills the screen and steal every click in that area.
+///
+/// The IPC carries no fullscreen flag, so this keys on the only tile that is
+/// ever sized to the whole output. It also cannot see niri's "raised but not
+/// focused" state, which only arises under focus-follows-mouse; there the
+/// floats stay up and this hides them.
+fn floats_are_visible(
+    wins: &[&Window],
+    active_window_id: Option<u64>,
+    l: &crate::niri::Logical,
+) -> bool {
+    let Some(active) = active_window_id.and_then(|id| wins.iter().find(|w| w.id == id)) else {
+        return true;
+    };
+    // Focus inside the floating space keeps the floats up regardless.
+    if active.is_floating {
+        return true;
+    }
+    let (tw, th) = active.layout.tile_size;
+    !((tw - l.width).abs() < 0.5 && (th - l.height).abs() < 0.5)
+}
+
+/// Turn a tile origin into the rectangle to highlight, dropping it if it is
+/// not on this output.
+///
+/// The rect is the window geometry, not the tile. niri's IPC recommends the
+/// tile for visual display, but a capture goes through `screenshot-window`,
+/// which re-renders the client's surface tree alone and so carries neither the
+/// border nor the focus ring. Highlighting the tile would promise a frame the
+/// saved file does not have.
 fn push_window(out: &mut Vec<WindowInfo>, w: &Window, tile_x: f64, tile_y: f64, l: &crate::niri::Logical) {
     let x = tile_x + w.layout.window_offset_in_tile.0;
     let y = tile_y + w.layout.window_offset_in_tile.1;
     let (width, height) = w.layout.window_size;
-    // Cull anything scrolled off this output.
-    if x + width <= l.x || x >= l.x + l.width || y + height <= l.y || y >= l.y + l.height {
+
+    // Clip to the output. niri draws nothing past the edge, whether the tile
+    // is scrolled off or a float was dragged over it, so the part beyond it
+    // must not be hoverable: emitting the whole rect left a live hit region
+    // and an undimmed band on the neighbouring monitor.
+    let x0 = x.max(l.x);
+    let y0 = y.max(l.y);
+    let x1 = (x + width).min(l.x + l.width);
+    let y1 = (y + height).min(l.y + l.height);
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
         return;
     }
     out.push(WindowInfo {
         title: w.title.clone().unwrap_or_default(),
         id: w.id.to_string(),
-        x,
-        y,
-        width,
-        height,
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
     });
 }
 
@@ -803,6 +852,101 @@ mod tests {
         assert_eq!(out.last().unwrap().id, "9", "floats must win the reverse hit scan");
     }
 
+    /// Builds a float at a position niri would report for it.
+    fn float(id: u64, x: f64, y: f64, w: f64, h: f64, focus: i64) -> Window {
+        let mut f = win(id, 1, 1, 1, w, h, focus);
+        f.is_floating = true;
+        f.layout.pos_in_scrolling_layout = None;
+        f.layout.tile_pos_in_workspace_view = Some((x, y));
+        f
+    }
+
+    /// niri already counts the bar into the position it reports for a float, so
+    /// adding the recovered tile top displaced every float by the bar height.
+    #[test]
+    fn a_top_bar_does_not_displace_a_float() {
+        // Same output as the top bar test: a 60px bar, one tile starting at 70.
+        let data = synth_capture(1000, 500, &[(10, 990)], 70, 490);
+        let mut s = snap(vec![win(1, 1, 1, 1, 980.0, 420.0, 100), float(9, 100.0, 100.0, 300.0, 200.0, 500)]);
+        s.outputs = one_output(0.0, 0.0, 1000.0, 500.0, 1.0);
+
+        let cap = Capture { data: &data, width: 1000, height: 500, stride: 4000 };
+        let out = layout_windows(&s, 10.0, Some(&cap));
+        let f = out.iter().find(|w| w.id == "9").expect("the float is on screen");
+        assert_eq!(f.x, 100.0);
+        assert_eq!(f.y, 100.0, "the float sits where niri says, not one bar lower");
+    }
+
+    /// A float's position is exact from IPC, so it must survive the tiled path
+    /// giving up. Losing it there is what made a float unselectable after a
+    /// scroll that could not be measured.
+    #[test]
+    fn a_float_survives_an_unmeasurable_scroll() {
+        let mut s = snap(vec![
+            win(1, 1, 1, 1, 1200.0, 1388.0, 100),
+            win(2, 1, 2, 1, 1200.0, 1388.0, 110),
+            win(3, 1, 3, 1, 1200.0, 1388.0, 120),
+            float(9, 400.0, 300.0, 800.0, 600.0, 500),
+        ]);
+        s.workspaces[0].active_window_id = Some(1);
+        // No capture, and the columns overflow the output, so the scroll offset
+        // is unknowable and no tile is reported.
+        let out = layout_windows(&s, 8.0, None);
+        assert_eq!(out.len(), 1, "no tile can be placed");
+        assert_eq!(out[0].id, "9");
+        assert_eq!((out[0].x, out[0].y), (400.0, 300.0));
+    }
+
+    /// niri hides the floating space while the active column is fullscreen.
+    #[test]
+    fn floats_are_dropped_behind_a_fullscreen_window() {
+        let mut s = snap(vec![
+            win(1, 1, 1, 1, 2560.0, 1440.0, 100),
+            float(9, 400.0, 300.0, 800.0, 600.0, 500),
+        ]);
+        s.workspaces[0].active_window_id = Some(1);
+        let out = layout_windows(&s, 8.0, None);
+        assert_eq!(out.len(), 1, "the hidden float must not steal clicks");
+        assert_eq!(out[0].id, "1");
+    }
+
+    /// Focus in the floating space keeps the floats on top of a fullscreen tile.
+    #[test]
+    fn a_focused_float_survives_a_fullscreen_window() {
+        let mut s = snap(vec![
+            win(1, 1, 1, 1, 2560.0, 1440.0, 100),
+            float(9, 400.0, 300.0, 800.0, 600.0, 500),
+        ]);
+        s.workspaces[0].active_window_id = Some(9);
+        let out = layout_windows(&s, 8.0, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.last().unwrap().id, "9");
+    }
+
+    /// A float can be dragged almost entirely past an output edge. Tiles are
+    /// already culled when they scroll off; floats were not.
+    #[test]
+    fn a_float_dragged_off_the_output_is_culled() {
+        let s = snap(vec![
+            win(1, 1, 1, 1, 2544.0, 1388.0, 100),
+            float(9, -800.0, 300.0, 800.0, 600.0, 500),
+        ]);
+        let out = layout_windows(&s, 8.0, None);
+        assert!(out.iter().all(|w| w.id != "9"), "an off-output float is not selectable");
+    }
+
+    /// The newest float has to come last so the reverse hit scan finds it first.
+    #[test]
+    fn overlapping_floats_are_ordered_by_focus() {
+        let s = snap(vec![
+            float(8, 100.0, 100.0, 900.0, 700.0, 400),
+            float(9, 200.0, 200.0, 900.0, 700.0, 900),
+        ]);
+        let out = layout_windows(&s, 8.0, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.last().unwrap().id, "9");
+    }
+
     #[test]
     fn non_normal_transform_is_skipped() {
         let mut s = snap(vec![win(1, 1, 1, 1, 2544.0, 1388.0, 100)]);
@@ -856,11 +1000,17 @@ mod tests {
         let cap = Capture { data: &data, width: 1000, height: 500, stride: 4000 };
         let out = layout_windows(&s, 10.0, Some(&cap));
 
-        // The leftmost column is scrolled off screen and culled; the other two
-        // must land exactly where they were painted.
-        let mut xs: Vec<f64> = out.iter().map(|w| w.x).collect();
-        xs.sort_by(f64::total_cmp);
-        assert_eq!(xs, vec![-150.0, 260.0, 670.0], "recovered scroll offset");
+        // Both edges of every emitted rect, since the first column hangs off
+        // the left and the third off the right, so each is clipped to the
+        // output. The offset still shows: the first column's right edge is at
+        // -150 + 400.
+        let mut edges: Vec<(f64, f64)> = out.iter().map(|w| (w.x, w.x + w.width)).collect();
+        edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(
+            edges,
+            vec![(0.0, 250.0), (260.0, 660.0), (670.0, 1000.0)],
+            "recovered scroll offset"
+        );
         assert!(out.iter().all(|w| w.y == 10.0), "tile top recovered: {out:?}");
     }
 
@@ -914,20 +1064,24 @@ mod tests {
                 failures.push(x0);
                 continue;
             }
-            let got = out.iter().map(|w| w.x).fold(f64::INFINITY, f64::min);
-            // The leftmost emitted window may be culled, so compare against the
-            // first column that is actually on screen.
-            let expected = {
+            let leftmost = out.iter().min_by(|a, b| a.x.total_cmp(&b.x)).unwrap();
+            // The first column on screen may hang off the left edge and be
+            // clipped there, which pins its left edge to 0 whatever the offset
+            // is. Its right edge is where the offset actually shows, so check
+            // both.
+            let (ex, ew) = {
                 let mut x = x0 as f64;
                 let mut first = None;
                 for w in widths {
-                    if x + w > 0.0 && first.is_none() { first = Some(x); }
+                    if x + w > 0.0 && first.is_none() { first = Some((x, w)); }
                     x += w + gap;
                 }
                 first.unwrap()
             };
-            if (got - expected).abs() > 1.5 {
-                wrong.push((x0, got, expected));
+            let (want_l, want_r) = (ex.max(0.0), (ex + ew).min(ow));
+            let (got_l, got_r) = (leftmost.x, leftmost.x + leftmost.width);
+            if (got_l - want_l).abs() > 1.5 || (got_r - want_r).abs() > 1.5 {
+                wrong.push((x0, got_l, want_l));
             }
         }
         assert!(

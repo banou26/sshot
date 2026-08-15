@@ -74,6 +74,13 @@ Tabbed columns overlay their tiles, so only one is on screen. niri exposes no
 per-column tab state, so the most recently focused tile in a column is taken as
 the visible one.
 
+Floating windows need none of that: niri reports their position outright, so
+they are placed exactly even when the tiled layout above them cannot be. They
+are offered on top of the tiles, newest first, and dropped when niri is hiding
+the floating space behind a fullscreen window or when one has been dragged off
+the output. A float being dragged right now has no position at all in the IPC
+and is skipped with a message.
+
 ## Development
 
 ```
