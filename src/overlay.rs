@@ -219,6 +219,11 @@ fn fill_rect(canvas: &mut [u8], phys_w: u32, phys_h: u32, r: Rect, color: [u8; 4
 /// painted.
 fn draw_border(canvas: &mut [u8], phys_w: u32, phys_h: u32, inner: Rect, bw: u32, color: [u8; 4]) {
     if bw == 0 { return; }
+    // The strips are placed just outside `inner`, so they can land on this
+    // surface even when `inner` itself does not. A region dragged to within a
+    // border width of an output edge otherwise drew a line down the monitor
+    // next door, around nothing.
+    if inner.clip(phys_w, phys_h).is_none() { return; }
     let outer = inner.inflate(bw);
     let top = Rect { x: outer.x, y: outer.y, w: outer.w, h: bw };
     let bottom = Rect { x: outer.x, y: inner.y + inner.h as i32, w: outer.w, h: bw };
@@ -811,5 +816,23 @@ mod tests {
     #[test]
     fn an_unchanged_empty_highlight_damages_nothing() {
         assert_eq!(damage_between(None, None, 3), None);
+    }
+
+    #[test]
+    fn a_border_for_a_rect_off_this_surface_paints_nothing() {
+        let (w, h) = (64u32, 64u32);
+        let mut canvas = vec![0u8; (w * h * 4) as usize];
+        // Ends exactly at this surface's origin, as a region drag on the
+        // monitor to the left does. The right strip would land on column 0.
+        draw_border(&mut canvas, w, h, Rect { x: -32, y: 0, w: 32, h: 64 }, 3, [255, 0, 0, 255]);
+        assert!(canvas.iter().all(|&b| b == 0), "no window edge exists on this output");
+    }
+
+    #[test]
+    fn a_border_for_a_rect_on_this_surface_still_paints() {
+        let (w, h) = (64u32, 64u32);
+        let mut canvas = vec![0u8; (w * h * 4) as usize];
+        draw_border(&mut canvas, w, h, Rect { x: 8, y: 8, w: 16, h: 16 }, 3, [255, 0, 0, 255]);
+        assert!(canvas.iter().any(|&b| b != 0), "the guard must not swallow a real border");
     }
 }

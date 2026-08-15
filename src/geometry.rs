@@ -319,7 +319,7 @@ pub fn layout_windows(snap: &Snapshot, gap: f64, cap: Option<&Capture>) -> Vec<W
     let space = CaptureSpace::from_snapshot(snap);
     let mut result = Vec::new();
 
-    for (name, out) in &snap.outputs {
+    for (name, out) in outputs_in_order(snap) {
         let Some(l) = &out.logical else { continue };
         if !l.is_normal_transform() {
             eprintln!("sshot: output {name} has a non-normal transform, skipping window detection");
@@ -419,6 +419,23 @@ pub fn layout_windows(snap: &Snapshot, gap: f64, cap: Option<&Capture>) -> Vec<W
     }
 
     result
+}
+
+/// Visit outputs left to right, then top to bottom, then by name.
+///
+/// `snap.outputs` is a `HashMap`, whose iteration order is reseeded in every
+/// process, so the emitted list and what `--debug-windows` printed changed
+/// between two runs with nothing on the desktop moving.
+fn outputs_in_order(snap: &Snapshot) -> Vec<(&String, &crate::niri::Output)> {
+    let mut outs: Vec<_> = snap.outputs.iter().collect();
+    outs.sort_by(|a, b| {
+        let key = |o: &crate::niri::Output| o.logical.as_ref().map(|l| (l.x, l.y));
+        key(a.1)
+            .partial_cmp(&key(b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    outs
 }
 
 /// Whether this workspace's floating windows are on screen at all.
@@ -850,6 +867,24 @@ mod tests {
         let out = layout_windows(&s, 8.0, None);
         assert_eq!(out.len(), 2);
         assert_eq!(out.last().unwrap().id, "9", "floats must win the reverse hit scan");
+    }
+
+    #[test]
+    fn outputs_are_visited_left_to_right() {
+        let mut s = snap(vec![]);
+        s.outputs = std::collections::HashMap::new();
+        for (name, x) in [("DP-9", 5120.0), ("DP-1", 0.0), ("DP-5", 2560.0)] {
+            s.outputs.insert(
+                name.into(),
+                Output {
+                    logical: Some(Logical {
+                        x, y: 0.0, width: 2560.0, height: 1440.0, scale: 1.5, transform: None,
+                    }),
+                },
+            );
+        }
+        let order: Vec<&str> = outputs_in_order(&s).iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(order, ["DP-1", "DP-5", "DP-9"]);
     }
 
     /// Builds a float at a position niri would report for it.
