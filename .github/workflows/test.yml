@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # smithay-client-toolkit's build script resolves xkbcommon through
+      # pkg-config and panics outright when xkbcommon.pc is missing, so the
+      # crate does not compile at all without the dev package. This is the
+      # only system library the build needs: wayland-backend is pulled in as
+      # its pure Rust implementation, so nothing links libwayland, and the
+      # protocol bindings are generated in-crate rather than by a system
+      # wayland-scanner. The same missing .pc file is why the README tells
+      # a developer to build inside `nix develop`.
+      - name: Install xkbcommon headers
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev
+
+      # The lints are clean today, so denying warnings keeps them that way.
+      # `cargo fmt` is deliberately NOT gated: the sources are hand formatted
+      # and rustfmt rewrites them, so a fmt check would fail on every commit.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The suite is 42 pure logic tests over the PPM parser, the config and
+      # filename rules, the niri IPC parsing, and the layout and damage maths.
+      # None of them opens a Wayland connection, a D-Bus session or a display,
+      # so a stock headless runner is enough.
+      - run: cargo test --locked
